@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import requests
 from io import BytesIO
+from pathlib import Path
 from difflib import SequenceMatcher
 
 # ---------------------------------------------------------
@@ -24,6 +25,7 @@ def get_similarity(a, b):
 # 2. 2중 교차 검증 핵심 로직
 # ---------------------------------------------------------
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_double_validated_address(company_name, branch_name, ledger_addr):
     headers = {"Authorization": f"KakaoAK {KAKAO_API_KEY}"}
 
@@ -56,16 +58,24 @@ def get_double_validated_address(company_name, branch_name, ledger_addr):
     return standard_ledger_addr, verified_addr, similarity
 
 # ---------------------------------------------------------
-# 3. 분석용 xlsx 템플릿 생성
+# 3. 샘플 명단 로드 및 xlsx 템플릿 생성
 # ---------------------------------------------------------
 
+SAMPLE_PATH = Path(__file__).parent / "조회처_명단_템플릿.xlsx"
+REQUIRED_COLS = ["기업명", "분지점", "주소", "전자조회가능회사"]
+
+@st.cache_data
+def load_sample_df():
+    """repo에 포함된 샘플 명단을 읽어온다 (템플릿·샘플 실행의 단일 기준)."""
+    df = pd.read_excel(SAMPLE_PATH)
+    df.columns = [str(c).strip() for c in df.columns]
+    for col in REQUIRED_COLS:
+        if col not in df.columns:
+            df[col] = None
+    return df[REQUIRED_COLS]
+
 def make_template_bytes():
-    template_df = pd.DataFrame({
-        "기업명": ["(주)예시상사", "샘플전자(주)"],
-        "분지점": ["", "본점"],
-        "주소": ["서울특별시 강남구 테헤란로 123", "경기도 성남시 분당구 판교로 45"],
-        "전자조회가능회사": ["샘플전자(주)", ""],
-    })
+    template_df = load_sample_df().fillna("")
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         template_df.to_excel(writer, index=False, sheet_name="조회처명단")
@@ -86,7 +96,48 @@ def make_template_bytes():
     return output.getvalue()
 
 # ---------------------------------------------------------
-# 4. 페이지 설정 및 헤더
+# 4. 검증 실행 (업로드/샘플 공용)
+# ---------------------------------------------------------
+
+def prepare_inputs(raw_df):
+    raw_df = raw_df.copy()
+    raw_df.columns = [str(c).strip() for c in raw_df.columns]
+    df_main = raw_df[raw_df['기업명'].notna()].copy()
+    e_list = raw_df['전자조회가능회사'].dropna().unique().tolist() if '전자조회가능회사' in raw_df.columns else []
+    return df_main, e_list
+
+def run_validation(df_main, e_list):
+    results_list = []
+    progress_bar = st.progress(0)
+    total = len(df_main)
+
+    for n, (_, row) in enumerate(df_main.iterrows(), start=1):
+        c_name = str(row['기업명']).strip()
+        b_name = str(row['분지점']).strip() if '분지점' in row and pd.notna(row['분지점']) else ""
+        ledger_addr = str(row['주소']).strip()
+
+        # 전자조회 체크
+        is_e = any(c_name in str(org) or str(org) in c_name for org in e_list)
+
+        # 2중 검증 실행
+        std_ledger, v_addr, sim = get_double_validated_address(c_name, b_name, ledger_addr)
+
+        results_list.append({
+            "기업명": c_name,
+            "장부 주소(Original)": ledger_addr,
+            "표준화 주소(장부)": std_ledger,
+            "검색된 주소(API)": v_addr,
+            "유사도": f"{sim}%",
+            "최종판정": "✅ 일치" if sim >= 80 else "🚨 확인필요",
+            "전자조회": "🔵 가능" if is_e else "⚪ 서면"
+        })
+        progress_bar.progress(n / total)
+
+    progress_bar.empty()
+    return pd.DataFrame(results_list)
+
+# ---------------------------------------------------------
+# 5. 페이지 설정 및 헤더
 # ---------------------------------------------------------
 st.set_page_config(page_title="조회서 실재성 검증 시스템", page_icon="🛡️", layout="wide")
 
@@ -107,6 +158,14 @@ with st.sidebar:
 
 st.title("🛡️ 조회서 실재성 2중 교차 검증 시스템")
 st.caption("장부상 주소와 기업 검색 결과를 API 기반으로 교차 대조하여 '지방 튐' 현상을 방지합니다.")
+
+# --- 샘플 즉시 실행 ---
+sample_df = load_sample_df()
+st.info(f"처음이시면 업로드 없이 샘플 **{len(sample_df)}건**으로 바로 실행해 보세요.")
+if st.button(f"⚡ 샘플 {len(sample_df)}건으로 즉시 검증", type="primary", use_container_width=True):
+    df_main, e_list = prepare_inputs(sample_df)
+    with st.spinner("샘플 명단 2중 교차 검증 중..."):
+        st.session_state.final_results = run_validation(df_main, e_list)
 
 with st.expander("📖 사용법 보기", expanded=False):
     st.markdown(
@@ -149,41 +208,14 @@ if 'final_results' not in st.session_state:
 
 if uploaded_file:
     raw_df = pd.read_excel(uploaded_file)
-    raw_df.columns = [c.strip() for c in raw_df.columns]
-    df_main = raw_df[raw_df['기업명'].notna()].copy()
-    e_list = raw_df['전자조회가능회사'].dropna().unique().tolist() if '전자조회가능회사' in raw_df.columns else []
+    df_main, e_list = prepare_inputs(raw_df)
 
     st.divider()
     st.subheader("③ 검증 실행")
     st.write(f"업로드된 조회처: **{len(df_main)}건**")
 
     if st.button("🚀 2중 교차 검증 시작", use_container_width=True):
-        results_list = []
-        progress_bar = st.progress(0)
-
-        for i, row in df_main.iterrows():
-            c_name = str(row['기업명']).strip()
-            b_name = str(row['분지점']).strip() if '분지점' in row and pd.notna(row['분지점']) else ""
-            ledger_addr = str(row['주소']).strip()
-
-            # 전자조회 체크
-            is_e = any(c_name in str(org) or str(org) in c_name for org in e_list)
-
-            # 2중 검증 실행
-            std_ledger, v_addr, sim = get_double_validated_address(c_name, b_name, ledger_addr)
-
-            results_list.append({
-                "기업명": c_name,
-                "장부 주소(Original)": ledger_addr,
-                "표준화 주소(장부)": std_ledger,
-                "검색된 주소(API)": v_addr,
-                "유사도": f"{sim}%",
-                "최종판정": "✅ 일치" if sim >= 80 else "🚨 확인필요",
-                "전자조회": "🔵 가능" if is_e else "⚪ 서면"
-            })
-            progress_bar.progress((i + 1) / len(df_main))
-
-        st.session_state.final_results = pd.DataFrame(results_list)
+        st.session_state.final_results = run_validation(df_main, e_list)
 
 if st.session_state.final_results is not None:
     result_df = st.session_state.final_results
