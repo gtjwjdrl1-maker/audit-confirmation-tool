@@ -25,6 +25,20 @@ def get_similarity(a, b):
 # 2. 2중 교차 검증 핵심 로직
 # ---------------------------------------------------------
 
+def _kakao_keyword_search(headers, query):
+    """카카오 키워드 검색 1건 실행 후 도로명 주소를 반환. 실패 시 None."""
+    try:
+        res = requests.get("https://dapi.kakao.com/v2/local/search/keyword.json",
+                            headers=headers, params={"query": query, "size": 1}).json()
+        if res.get('documents'):
+            doc = res['documents'][0]
+            addr = doc.get('road_address_name') or doc.get('address_name')
+            return addr or None
+    except:
+        pass
+    return None
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_double_validated_address(company_name, branch_name, ledger_addr):
     headers = {"Authorization": f"KakaoAK {KAKAO_API_KEY}"}
@@ -38,24 +52,34 @@ def get_double_validated_address(company_name, branch_name, ledger_addr):
             standard_ledger_addr = addr_res['documents'][0]['road_address']['address_name'] if addr_res['documents'][0]['road_address'] else addr_res['documents'][0]['address_name']
     except: pass
 
-    # [Step 2] 기업명(+지역힌트)으로 검색하여 '검증 주소' 획득
-    verified_addr = "❌ 검색불가"
+    # [Step 2] 1차 검색 — 분지점이 비어있으면 '본사'를 기본값으로 사용
+    #   (다지점 기업은 분지점을 명시하지 않으면 검색 결과가 엉뚱한 지방으로 튈 수 있음)
     city_hint = ledger_addr.split()[0] if ledger_addr else ""
-    search_query = f"{city_hint} {company_name} {branch_name or ''}".strip()
+    effective_branch = branch_name.strip() if branch_name and branch_name.strip() else "본사"
+    search_query_1 = f"{city_hint} {company_name} {effective_branch}".strip()
+    search_method = f"기업명+{effective_branch}"
 
-    try:
-        name_res = requests.get("https://dapi.kakao.com/v2/local/search/keyword.json",
-                                headers=headers, params={"query": search_query, "size": 1}).json()
-        if name_res.get('documents'):
-            verified_addr = name_res['documents'][0]['road_address_name']
-    except: pass
+    verified_addr = _kakao_keyword_search(headers, search_query_1)
 
-    # [Step 3] 두 표준 주소 간 유사도 측정
+    # [Step 3] 1차 검색이 '검색불가'면 — 분지점/본사 없이 기업명만으로 재검색
+    #   (일부 기업은 '본사' 키워드가 붙으면 카카오 검색이 오히려 실패하는 경우가 있음)
+    if not verified_addr:
+        search_query_2 = f"{city_hint} {company_name}".strip()
+        retry_addr = _kakao_keyword_search(headers, search_query_2)
+        if retry_addr:
+            verified_addr = retry_addr
+            search_method = "기업명만(재검색)"
+
+    if not verified_addr:
+        verified_addr = "❌ 검색불가"
+        search_method = "검색실패(2회 시도)"
+
+    # [Step 4] 두 표준 주소 간 유사도 측정
     similarity = 0
     if standard_ledger_addr != "❌ 장부주소 불명" and verified_addr != "❌ 검색불가":
         similarity = get_similarity(standard_ledger_addr, verified_addr)
 
-    return standard_ledger_addr, verified_addr, similarity
+    return standard_ledger_addr, verified_addr, similarity, search_method
 
 # ---------------------------------------------------------
 # 3. 샘플 명단 로드 및 xlsx 템플릿 생성
@@ -119,14 +143,15 @@ def run_validation(df_main, e_list):
         # 전자조회 체크
         is_e = any(c_name in str(org) or str(org) in c_name for org in e_list)
 
-        # 2중 검증 실행
-        std_ledger, v_addr, sim = get_double_validated_address(c_name, b_name, ledger_addr)
+        # 2중 검증 실행 (본사 기본 검색 → 실패 시 기업명만으로 재검색)
+        std_ledger, v_addr, sim, method = get_double_validated_address(c_name, b_name, ledger_addr)
 
         results_list.append({
             "기업명": c_name,
             "장부 주소(Original)": ledger_addr,
             "표준화 주소(장부)": std_ledger,
             "검색된 주소(API)": v_addr,
+            "검색방식": method,
             "유사도": f"{sim}%",
             "최종판정": "✅ 일치" if sim >= 80 else "🚨 확인필요",
             "전자조회": "🔵 가능" if is_e else "⚪ 서면"
@@ -180,9 +205,11 @@ with st.expander("📖 사용법 보기", expanded=False):
 | 주소 | 장부상 주소 | 필수 |
 | 전자조회가능회사 | 전자조회가 가능한 회사명 목록 | 선택 |
 
+> ⚠️ **다지점 기업 주의사항**: 지점이 여러 곳인 기업은 '분지점'을 비워두면 시스템이 기본값으로 '본사'를 붙여 검색합니다. 그래도 검색이 안 되는 경우 기업명만으로 자동 재검색하지만, 그 결과가 실제 조회 대상 지점과 다를 수 있으니 **가능하면 '분지점'란에 정확한 지점명을 직접 입력**해야 정확도가 올라갑니다.
+
 3. **파일 업로드** — ②에서 작성한 엑셀 파일을 업로드합니다.
-4. **검증 실행** — '2중 교차 검증 시작' 버튼을 누르면 장부 주소와 기업명 검색 결과를 각각 표준 주소로 변환한 뒤 유사도를 비교합니다.
-5. **결과 확인** — 유사도 80% 미만인 건은 🚨 확인필요로 표시되며, 결과표는 엑셀로 다운로드할 수 있습니다.
+4. **검증 실행** — '2중 교차 검증 시작' 버튼을 누르면 장부 주소와 기업명 검색 결과를 각각 표준 주소로 변환한 뒤 유사도를 비교합니다. 기업명 검색은 1차로 '분지점(기본값: 본사)'을 포함해 시도하고, 검색불가 시 분지점 없이 기업명만으로 2차 재검색합니다.
+5. **결과 확인** — 유사도 80% 미만인 건은 🚨 확인필요로 표시되며, '검색방식' 열에서 1차(본사 포함)/2차(기업명만 재검색) 여부를 확인할 수 있습니다. 결과표는 엑셀로 다운로드할 수 있습니다.
         """
     )
 
